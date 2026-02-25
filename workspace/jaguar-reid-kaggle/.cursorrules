@@ -1,0 +1,6 @@
+# Jaguar Re-ID (Kaggle) – Cursor instructions
+
+- Project root: this folder. Run scripts from here (e.g. `python scripts/update_ssh.py`).
+- Data: `data/` (raw and processed datasets).
+- Code: `scripts/` for runnable Python scripts; add shared libs under `src/` if needed.
+- Dependencies: `requirements.txt`. Use the venv in the parent workspace (`../venv` on RunPod or repo root `.venv` locally).

@@ -1,0 +1,25 @@
+# Core Deep Learning
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0
+accelerate
+
+# Segmentation (SAM3)
+git+https://github.com/facebookresearch/sam3.git
+transformers>=4.45.0
+supervision
+
+# Re-ID & Backbones
+timm>=1.0.7
+wildlife-tools
+pytorch-metric-learning
+
+# Data Handling & Math
+numpy<2.0.0
+pandas
+opencv-python
+Pillow
+scikit-learn
+matplotlib
+tqdm
+
