@@ -9,6 +9,12 @@ CUDA so you don't accidentally run heavy inference on a local machine. Use
 Usage (on RunPod / GPU machine):
     python scripts/crop_jaguars_sam3.py
 
+Dry run (few samples only; then delete output and run without --limit):
+    python scripts/crop_jaguars_sam3.py --limit 5
+
+Resume after pod stop (skips images that already have crops):
+    python scripts/crop_jaguars_sam3.py --resume
+
 Usage (local, skip processing):
     python scripts/crop_jaguars_sam3.py   # exits with instructions to use RunPod
 
@@ -88,6 +94,18 @@ def parse_args():
         action="store_true",
         help="Allow running on CPU if CUDA is not available (slow; for local testing only)",
     )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process only the first N images (for dry run). Omit for full run.",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip input images that already have at least one crop in the output dir (for resuming after pod stop).",
+    )
     return p.parse_args()
 
 
@@ -143,13 +161,16 @@ def main():
         sys.exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = [
+    image_paths = sorted([
         p for p in input_dir.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    ]
+    ])
     if not image_paths:
         print(f"No images found in {input_dir}", file=sys.stderr)
         sys.exit(1)
+    if args.limit is not None:
+        image_paths = image_paths[: args.limit]
+        print(f"Dry run: processing only {len(image_paths)} image(s) (--limit={args.limit})")
 
     print(f"Loading SAM 3 model on device={device}...")
     build_sam3_image_model, Sam3Processor = _load_sam3()
@@ -158,7 +179,13 @@ def main():
     print("Model loaded.")
 
     total_crops = 0
+    skipped = 0
     for path in image_paths:
+        if args.resume:
+            existing = list(output_dir.glob(f"{path.stem}_crop_*"))
+            if existing:
+                skipped += 1
+                continue
         try:
             image = Image.open(path).convert("RGB")
         except Exception as e:
@@ -190,6 +217,8 @@ def main():
             total_crops += 1
             print(f"  {path.name} -> {out_name} (score={score:.2f})")
 
+    if args.resume and skipped:
+        print(f"Skipped {skipped} image(s) (already had crops).")
     print(f"Done. Saved {total_crops} crops to {output_dir}")
 
 
