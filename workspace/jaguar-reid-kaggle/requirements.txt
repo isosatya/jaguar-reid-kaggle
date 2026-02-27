@@ -23,3 +23,8 @@ scikit-learn
 matplotlib
 tqdm
 
+# Add near "Data Handling & Math" or at the end:
+einops
+decord
+pycocotools
+

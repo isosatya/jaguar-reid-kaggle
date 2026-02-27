@@ -106,6 +106,13 @@ def parse_args():
         action="store_true",
         help="Skip input images that already have at least one crop in the output dir (for resuming after pod stop).",
     )
+    p.add_argument(
+        "--max-area-ratio",
+        type=float,
+        default=0.90,
+        metavar="R",
+        help="Skip saving a crop if its area is larger than this fraction of the image (avoids full-frame 'crops'). Default 0.90. Use 1.0 to allow full-frame.",
+    )
     return p.parse_args()
 
 
@@ -208,6 +215,13 @@ def main():
             if area < args.min_area:
                 continue
             x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
+            crop_w = x1 - x0
+            crop_h = y1 - y0
+            crop_area = crop_w * crop_h
+            image_area = w * h
+            if image_area > 0 and (crop_area / image_area) > args.max_area_ratio:
+                print(f"  {path.name} -> skip crop {i} (crop is {100*crop_area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
+                continue
             crop = image.crop((x0, y0, x1, y1))
             stem = path.stem
             ext = path.suffix.lower()
