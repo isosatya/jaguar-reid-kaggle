@@ -1,6 +1,23 @@
-# Jaguar Re-ID (Kaggle) – Cursor instructions
+# Jaguar Re-ID (Kaggle) – Development Rules
 
-- Project root: this folder. Run scripts from here (e.g. `python scripts/update_ssh.py`).
-- Data: `data/` (raw and processed datasets).
-- Code: `scripts/` for runnable Python scripts; add shared libs under `src/` if needed.
-- Dependencies: `requirements.txt`. Use the venv in the parent workspace (`../venv` on RunPod or repo root `.venv` locally).
+## 1. Environment & Paths
+- **Workspace Root**: Always run commands from the project root.
+- **Python Execution**: Use `python scripts/<script_name>.py`. Do not assume absolute paths.
+- **Virtual Env**: Use the existing venv (`.venv` or `../venv`). DO NOT suggest `pip install` unless a package is missing from `requirements.txt`.
+- **Data Access**: All datasets are in `data/`. Never hardcode local user paths (e.g., `/home/user/...`). Use `Path` objects from `pathlib`.
+
+## 2. Code Generation Guidelines (Anti-Bloat)
+- **Modular Logic**: Keep `scripts/` for execution logic. Move heavy lifting (Model architectures, Loss functions, Re-ID metrics) to `src/`.
+- **Partial Updates**: When editing, use `// ... existing code ...` or `# ... existing imports ...`. DO NOT rewrite stable functions unless explicitly asked.
+- **No Boilerplate**: Do not add extra docstrings, logging, or error handling unless specifically requested for a production-ready script.
+- **Vectorization**: Prioritize `numpy` or `torch` vectorized operations over Python loops for data processing.
+
+## 3. Computer Vision & Re-ID Specifics
+- **Framework**: Use PyTorch for model logic.
+- **Reproducibility**: Always include a seed (e.g., `42`) in training scripts.
+- **Efficiency**: For image loading, prefer `cv2` or `PIL` with `prefetch` in DataLoaders to prevent CPU bottlenecks.
+- **Kaggle Context**: Keep memory constraints in mind. Avoid loading the entire dataset into RAM; use generators or `torch.utils.data.Dataset`.
+
+## 4. Communication Prefs
+- **Directness**: Skip "Okay, I will help with that." Go straight to the code or terminal command.
+- **Rationale**: If you refactor a script, explain *why* (e.g., "Moved to src/ to enable unit testing").

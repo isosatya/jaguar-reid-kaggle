@@ -12,6 +12,12 @@ Usage (on RunPod / GPU machine):
 Dry run (few samples only; then delete output and run without --limit):
     python scripts/crop_jaguars_sam3.py --limit 5
 
+Dry run with multiple prompts (saves each crop with prompt in filename, e.g. front_crop_0_jaguar_body.png):
+    python scripts/crop_jaguars_sam3.py --limit 5
+
+  By default uses a built-in list of prompts (jaguar, jaguar body, jaguar flank, etc.).
+  Use --prompts "a,b,c" to override, or --single to use only --prompt.
+
 Resume after pod stop (skips images that already have crops):
     python scripts/crop_jaguars_sam3.py --resume
 
@@ -25,6 +31,7 @@ Usage (local, allow CPU for testing):
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +47,22 @@ def _load_sam3():
 
 # Supported image extensions
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# Default prompts used when neither --prompts nor --single is set (dry-run comparison)
+DEFAULT_PROMPTS = [
+    "jaguar",
+    "jaguar body",
+    "jaguar flank",
+    "jaguar rosette",
+    "jaguar fur pattern",
+]
+
+
+def prompt_to_slug(prompt: str) -> str:
+    """Sanitize prompt for use in filenames (alphanumeric and underscores only)."""
+    s = prompt.strip().replace(" ", "_").replace("/", "-").replace("\\", "-")
+    s = re.sub(r"[^\w\-]", "", s)  # drop other non-word chars
+    return s or "prompt"
 
 
 def parse_args():
@@ -62,7 +85,19 @@ def parse_args():
         "--prompt",
         type=str,
         default="jaguar",
-        help='Text prompt for SAM 3 (e.g. "jaguar", "jaguar flank pattern", "rosette skin")',
+        help='Single prompt (used only with --single).',
+    )
+    p.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        metavar="P1,P2,...",
+        help='Comma-separated list of prompts; overrides default list. Use e.g. --prompts "jaguar" for single prompt.',
+    )
+    p.add_argument(
+        "--single",
+        action="store_true",
+        help="Use only --prompt (single prompt) instead of the default prompt list.",
     )
     p.add_argument(
         "--min-score",
@@ -168,6 +203,15 @@ def main():
         sys.exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.prompts is not None:
+        prompt_list = [p.strip() for p in args.prompts.split(",") if p.strip()]
+    elif args.single:
+        prompt_list = [args.prompt]
+    else:
+        prompt_list = list(DEFAULT_PROMPTS)
+    if len(prompt_list) > 1:
+        print(f"Running with {len(prompt_list)} prompts: {prompt_list}")
+
     image_paths = sorted([
         p for p in input_dir.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
@@ -187,49 +231,55 @@ def main():
 
     total_crops = 0
     skipped = 0
-    for path in image_paths:
-        if args.resume:
-            existing = list(output_dir.glob(f"{path.stem}_crop_*"))
-            if existing:
-                skipped += 1
+    for prompt in prompt_list:
+        prompt_slug = prompt_to_slug(prompt)
+        if len(prompt_list) > 1:
+            print(f"\n--- prompt: {prompt!r} (slug: {prompt_slug}) ---")
+        for path in image_paths:
+            if args.resume:
+                existing = list(output_dir.glob(f"{path.stem}_crop_*_{prompt_slug}{path.suffix}"))
+                if not existing and len(prompt_list) == 1:
+                    existing = list(output_dir.glob(f"{path.stem}_crop_*{path.suffix}"))
+                if existing:
+                    skipped += 1
+                    continue
+            try:
+                image = Image.open(path).convert("RGB")
+            except Exception as e:
+                print(f"Skip {path}: {e}", file=sys.stderr)
                 continue
-        try:
-            image = Image.open(path).convert("RGB")
-        except Exception as e:
-            print(f"Skip {path}: {e}", file=sys.stderr)
-            continue
-        w, h = image.size
-        state = processor.set_image(image)
-        state = processor.set_text_prompt(args.prompt, state)
-        boxes = state["boxes"]
-        scores = state["scores"]
-        if boxes is None or len(boxes) == 0:
-            continue
-        boxes = boxes.cpu()
-        scores = scores.cpu()
-        if scores.dim() == 0:
-            scores = scores.unsqueeze(0)
-        for i, (box, score) in enumerate(zip(boxes.tolist(), scores.tolist())):
-            x0, y0, x1, y1 = box
-            area = (x1 - x0) * (y1 - y0)
-            if area < args.min_area:
+            w, h = image.size
+            state = processor.set_image(image)
+            state = processor.set_text_prompt(prompt, state)
+            boxes = state["boxes"]
+            scores = state["scores"]
+            if boxes is None or len(boxes) == 0:
                 continue
-            x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
-            crop_w = x1 - x0
-            crop_h = y1 - y0
-            crop_area = crop_w * crop_h
-            image_area = w * h
-            if image_area > 0 and (crop_area / image_area) > args.max_area_ratio:
-                print(f"  {path.name} -> skip crop {i} (crop is {100*crop_area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
-                continue
-            crop = image.crop((x0, y0, x1, y1))
-            stem = path.stem
-            ext = path.suffix.lower()
-            out_name = f"{stem}_crop_{i}{ext}"
-            out_path = output_dir / out_name
-            crop.save(out_path, quality=95)
-            total_crops += 1
-            print(f"  {path.name} -> {out_name} (score={score:.2f})")
+            boxes = boxes.cpu()
+            scores = scores.cpu()
+            if scores.dim() == 0:
+                scores = scores.unsqueeze(0)
+            for i, (box, score) in enumerate(zip(boxes.tolist(), scores.tolist())):
+                x0, y0, x1, y1 = box
+                area = (x1 - x0) * (y1 - y0)
+                if area < args.min_area:
+                    continue
+                x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
+                crop_w = x1 - x0
+                crop_h = y1 - y0
+                crop_area = crop_w * crop_h
+                image_area = w * h
+                if image_area > 0 and (crop_area / image_area) > args.max_area_ratio:
+                    print(f"  {path.name} -> skip crop {i} (crop is {100*crop_area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
+                    continue
+                crop = image.crop((x0, y0, x1, y1))
+                stem = path.stem
+                ext = path.suffix.lower()
+                out_name = f"{stem}_crop_{i}_{prompt_slug}{ext}"
+                out_path = output_dir / out_name
+                crop.save(out_path, quality=95)
+                total_crops += 1
+                print(f"  {path.name} -> {out_name} (score={score:.2f})")
 
     if args.resume and skipped:
         print(f"Skipped {skipped} image(s) (already had crops).")
