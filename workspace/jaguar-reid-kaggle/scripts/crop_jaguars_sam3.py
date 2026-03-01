@@ -6,23 +6,20 @@ Designed to run on a GPU pod (e.g. RunPod). By default refuses to run without
 CUDA so you don't accidentally run heavy inference on a local machine. Use
 --allow-cpu only for local testing (will be slow).
 
+Two modes:
+- Text prompt: use --prompts / --single (no reference dir).
+- Reference crops: by default the script uses data/train_crops/train (hardcoded).
+  It picks up to 5 random crop examples and runs in reference (box-prompt) mode.
+  Do not use processed_gallery crops as reference.
+
 Usage (on RunPod / GPU machine):
     python scripts/crop_jaguars_sam3.py
 
-Dry run (few samples only; then delete output and run without --limit):
+Dry run (few samples only):
     python scripts/crop_jaguars_sam3.py --limit 5
 
-Dry run with multiple prompts (saves each crop with prompt in filename, e.g. front_crop_0_jaguar_body.png):
-    python scripts/crop_jaguars_sam3.py --limit 5
-
-  By default uses a built-in list of prompts (jaguar, jaguar body, jaguar flank, etc.).
-  Use --prompts "a,b,c" to override, or --single to use only --prompt.
-
-Resume after pod stop (skips images that already have crops):
+Resume after pod stop:
     python scripts/crop_jaguars_sam3.py --resume
-
-Usage (local, skip processing):
-    python scripts/crop_jaguars_sam3.py   # exits with instructions to use RunPod
 
 Usage (local, allow CPU for testing):
     python scripts/crop_jaguars_sam3.py --allow-cpu
@@ -31,6 +28,7 @@ Usage (local, allow CPU for testing):
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import sys
 from pathlib import Path
@@ -47,6 +45,9 @@ def _load_sam3():
 
 # Supported image extensions
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# Max number of reference crop examples to use when reference-crops-dir is set
+MAX_REFERENCE_CROP_EXAMPLES = 5
 
 # Default prompts used when neither --prompts nor --single is set (dry-run comparison)
 DEFAULT_PROMPTS = [
@@ -73,7 +74,7 @@ def parse_args():
         "--input-dir",
         type=Path,
         default=Path("data/raw_gallery/jaguars_images"),
-        help="Directory containing raw jaguar images",
+        help="Directory containing raw jaguar images (searched recursively)",
     )
     p.add_argument(
         "--output-dir",
@@ -148,6 +149,20 @@ def parse_args():
         metavar="R",
         help="Skip saving a crop if its area is larger than this fraction of the image (avoids full-frame 'crops'). Default 0.90. Use 1.0 to allow full-frame.",
     )
+    p.add_argument(
+        "--reference-crops-dir",
+        type=Path,
+        default=Path("data/train_crops/train"),
+        metavar="DIR",
+        help="Directory of good crop examples. Default: data/train_crops/train (up to 5 random for reference mode).",
+    )
+    p.add_argument(
+        "--reference-crop",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="(Deprecated) Single reference crop path. Prefer --reference-crops-dir.",
+    )
     return p.parse_args()
 
 
@@ -203,7 +218,48 @@ def main():
         sys.exit(1)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.prompts is not None:
+    use_reference_crop = False
+    reference_crop_paths: list[Path] = []
+
+    # Legacy: single file
+    if args.reference_crop is not None:
+        ref_path = args.reference_crop.resolve()
+        if not ref_path.is_file():
+            print(f"Error: reference crop not found: {ref_path}", file=sys.stderr)
+            sys.exit(1)
+        reference_crop_paths = [ref_path]
+        use_reference_crop = True
+        print(f"Using reference-crop mode (no text prompt): {ref_path.name}")
+    elif args.reference_crops_dir is not None:
+        ref_dir = args.reference_crops_dir.resolve()
+        if not ref_dir.is_dir():
+            print(
+                f"Error: reference crops dir not found: {ref_dir}\n"
+                "Create it and add crop images (e.g. from train), or run without reference mode (text prompts).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        all_refs = sorted(
+            p for p in ref_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not all_refs:
+            print(
+                f"Error: no images in reference crops dir: {ref_dir}\n"
+                "Add crop images there, or run without reference mode.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        n = min(MAX_REFERENCE_CROP_EXAMPLES, len(all_refs))
+        reference_crop_paths = random.sample(all_refs, n)
+        use_reference_crop = True
+        print(f"Using reference-crops mode ({len(reference_crop_paths)} examples from {ref_dir}):")
+        for p in reference_crop_paths:
+            print(f"  - {p.name}")
+
+    if use_reference_crop:
+        prompt_list = ["reference"]  # single pass, slug for filenames
+    elif args.prompts is not None:
         prompt_list = [p.strip() for p in args.prompts.split(",") if p.strip()]
     elif args.single:
         prompt_list = [args.prompt]
@@ -213,7 +269,7 @@ def main():
         print(f"Running with {len(prompt_list)} prompts: {prompt_list}")
 
     image_paths = sorted([
-        p for p in input_dir.iterdir()
+        p for p in input_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     ])
     if not image_paths:
@@ -236,10 +292,14 @@ def main():
         if len(prompt_list) > 1:
             print(f"\n--- prompt: {prompt!r} (slug: {prompt_slug}) ---")
         for path in image_paths:
+            try:
+                stem = "_".join(path.relative_to(input_dir).with_suffix("").parts)
+            except ValueError:
+                stem = path.stem
             if args.resume:
-                existing = list(output_dir.glob(f"{path.stem}_crop_*_{prompt_slug}{path.suffix}"))
+                existing = list(output_dir.glob(f"{stem}_crop_*_{prompt_slug}{path.suffix}"))
                 if not existing and len(prompt_list) == 1:
-                    existing = list(output_dir.glob(f"{path.stem}_crop_*{path.suffix}"))
+                    existing = list(output_dir.glob(f"{stem}_crop_*{path.suffix}"))
                 if existing:
                     skipped += 1
                     continue
@@ -250,7 +310,11 @@ def main():
                 continue
             w, h = image.size
             state = processor.set_image(image)
-            state = processor.set_text_prompt(prompt, state)
+            if use_reference_crop:
+                # Full-image box in normalized [cx, cy, w, h]; SAM3 segments main subject (no text).
+                state = processor.add_geometric_prompt([0.5, 0.5, 1.0, 1.0], True, state)
+            else:
+                state = processor.set_text_prompt(prompt, state)
             boxes = state["boxes"]
             scores = state["scores"]
             if boxes is None or len(boxes) == 0:
@@ -273,7 +337,6 @@ def main():
                     print(f"  {path.name} -> skip crop {i} (crop is {100*crop_area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
                     continue
                 crop = image.crop((x0, y0, x1, y1))
-                stem = path.stem
                 ext = path.suffix.lower()
                 out_name = f"{stem}_crop_{i}_{prompt_slug}{ext}"
                 out_path = output_dir / out_name
