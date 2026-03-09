@@ -95,8 +95,8 @@ def main():
     else:
         text_prompts = list(DEFAULT_TEXT_PROMPTS)
 
-    # Single list of phrases per image (Grounding DINO expects list of list for batch; we do one image at a time)
-    text_labels = [text_prompts]
+    # Processor expects text as list of strings (one per image); phrases in one string separated by " . "
+    text_for_batch = [" . ".join(p.strip() for p in text_prompts)]
 
     image_paths = sorted(
         p for p in input_dir.rglob("*")
@@ -133,7 +133,7 @@ def main():
             continue
         w, h = image.size
 
-        inputs = processor(images=image, text=text_labels, return_tensors="pt").to(device)
+        inputs = processor(images=image, text=text_for_batch, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model(**inputs)
 

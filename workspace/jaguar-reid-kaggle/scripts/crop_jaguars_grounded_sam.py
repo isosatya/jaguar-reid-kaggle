@@ -103,7 +103,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     text_prompts = [p.strip() for p in args.prompts.split(",")] if args.prompts else list(DEFAULT_TEXT_PROMPTS)
-    text_labels = [text_prompts]
+    # Processor expects list of strings (one per image); phrases in one string separated by " . "
+    text_for_batch = [" . ".join(p.strip() for p in text_prompts)]
 
     image_paths = sorted(
         p for p in input_dir.rglob("*")
@@ -153,7 +154,7 @@ def main():
         w, h = image.size
 
         # 1) Grounding DINO
-        inputs_gd = gd_processor(images=image, text=text_labels, return_tensors="pt").to(device)
+        inputs_gd = gd_processor(images=image, text=text_for_batch, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs_gd = gd_model(**inputs_gd)
         results = gd_processor.post_process_grounded_object_detection(
