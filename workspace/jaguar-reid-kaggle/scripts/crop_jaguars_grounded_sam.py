@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
-Crop raw jaguar images using Grounded SAM: Grounding DINO (detection) + SAM2 (mask refinement).
+Crop raw jaguar images using Grounded SAM: Grounding DINO (detection) + SAM2 (mask).
 
-1) Grounding DINO gets bounding boxes from text prompts (part-friendly: jaguar fur, body, etc.).
-2) Each box is refined with SAM2 to get a segmentation mask; crops use the mask bounding box.
-
-Requires: transformers, torch, Pillow. Models: IDEA-Research/grounding-dino-tiny, facebook/sam2.1-hiera-small (or -large).
-
-Usage:
-    python scripts/crop_jaguars_grounded_sam.py
-    python scripts/crop_jaguars_grounded_sam.py --limit 5 --resume
+Outputs contour crops (jaguar shape, transparent background) as PNG, not rectangular frames.
 """
 
 from __future__ import annotations
@@ -19,6 +12,7 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -63,6 +57,7 @@ def parse_args():
     p.add_argument("--min-area", type=int, default=800)
     p.add_argument("--padding", type=float, default=0.08)
     p.add_argument("--max-area-ratio", type=float, default=0.90)
+    p.add_argument("--max-fill-ratio", type=float, default=0.92, help="Skip when best mask fill ratio > this (1.0=allow squares).")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--allow-cpu", action="store_true")
@@ -87,6 +82,81 @@ def mask_to_bbox(mask: torch.Tensor) -> tuple[int, int, int, int] | None:
     y0, y1 = int(y_where[0].item()), int(y_where[-1].item()) + 1
     x0, x1 = int(x_where[0].item()), int(x_where[-1].item()) + 1
     return (x0, y0, x1, y1)
+
+
+def pick_contour_mask(masks: torch.Tensor) -> tuple[torch.Tensor | None, float]:
+    """From [num_masks, H, W], pick the mask with lowest fill ratio (least rectangular).
+    Returns (mask, fill_ratio). fill_ratio=1 means full rectangle."""
+    if masks.dim() == 4:
+        masks = masks[0]
+    if masks.dim() == 2:
+        return masks, 1.0
+    if masks.dim() != 3 or masks.shape[0] == 0:
+        m = masks[0] if masks.numel() > 0 else None
+        return m, 1.0 if m is not None else 1.0
+    n = masks.shape[0]
+    best_idx = 0
+    best_ratio = 1.0
+    for i in range(n):
+        m = masks[i] > 0.5
+        area = m.float().sum().item()
+        if area < 100:
+            continue
+        ys = torch.any(m, dim=1)
+        xs = torch.any(m, dim=0)
+        y_where = torch.where(ys)[0]
+        x_where = torch.where(xs)[0]
+        if len(y_where) == 0 or len(x_where) == 0:
+            continue
+        bw = int(x_where[-1].item() - x_where[0].item()) + 1
+        bh = int(y_where[-1].item() - y_where[0].item()) + 1
+        bbox_area = bw * bh
+        if bbox_area <= 0:
+            continue
+        ratio = area / bbox_area
+        if ratio < best_ratio:
+            best_ratio = ratio
+            best_idx = i
+    return masks[best_idx], best_ratio
+
+
+def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08) -> Image.Image | None:
+    """Crop image to the mask contour (transparent outside). Uses continuous mask for soft edges."""
+    if hasattr(mask, "cpu"):
+        mask = mask.cpu().numpy()
+    mask = np.asarray(mask).squeeze().astype(np.float32)
+    if mask.ndim != 2 or mask.size == 0:
+        return None
+    mask = np.clip(mask, 0.0, 1.0)
+    h, w = mask.shape
+    if image.size != (w, h):
+        mask = np.array(Image.fromarray((mask * 255).astype(np.uint8)).resize(image.size, Image.LANCZOS)) / 255.0
+        h, w = mask.shape
+    binary = mask > 0.2
+    ys = np.any(binary, axis=1)
+    xs = np.any(binary, axis=0)
+    y_where = np.where(ys)[0]
+    x_where = np.where(xs)[0]
+    if len(y_where) == 0 or len(x_where) == 0:
+        return None
+    y0, y1 = int(y_where[0]), int(y_where[-1]) + 1
+    x0, x1 = int(x_where[0]), int(x_where[-1]) + 1
+    bw, bh = x1 - x0, y1 - y0
+    dx = max(1, int(bw * padding))
+    dy = max(1, int(bh * padding))
+    x0 = max(0, x0 - dx)
+    y0 = max(0, y0 - dy)
+    x1 = min(w, x1 + dx)
+    y1 = min(h, y1 + dy)
+    img_crop = np.array(image.crop((x0, y0, x1, y1)))
+    if img_crop.ndim == 2:
+        img_crop = np.stack([img_crop] * 3, axis=-1)
+    mask_crop = mask[y0:y1, x0:x1].astype(np.float32)
+    if mask_crop.shape[:2] != img_crop.shape[:2]:
+        mask_crop = np.array(Image.fromarray((mask_crop * 255).astype(np.uint8)).resize((img_crop.shape[1], img_crop.shape[0]), Image.LANCZOS)) / 255.0
+    alpha = (np.clip(mask_crop, 0, 1) * 255).astype(np.uint8)
+    rgba = np.dstack([img_crop[..., 0], img_crop[..., 1], img_crop[..., 2], alpha])
+    return Image.fromarray(rgba, "RGBA")
 
 
 def main():
@@ -143,7 +213,7 @@ def main():
             stem = "_".join(path.relative_to(input_dir).with_suffix("").parts)
         except ValueError:
             stem = path.stem
-        if args.resume and list(output_dir.glob(f"{stem}_crop_*{path.suffix}")):
+        if args.resume and list(output_dir.glob(f"{stem}_crop_*.png")):
             skipped += 1
             continue
         try:
@@ -184,30 +254,45 @@ def main():
             if w * h > 0 and (area / (w * h)) > args.max_area_ratio:
                 continue
 
-            # 2) Optionally refine with SAM2
+            # 2) Optionally refine with SAM2 and save contour crop
             if sam_processor is not None and sam_model is not None:
                 try:
-                    # SAM2 expects [x_min, y_min, x_max, y_max] per image, list of list of boxes
                     input_boxes = [[[x0, y0, x1, y1]]]
                     inputs_sam = sam_processor(images=image, input_boxes=input_boxes, return_tensors="pt").to(device)
                     with torch.no_grad():
-                        outputs_sam = sam_model(**inputs_sam, multimask_output=False)
+                        outputs_sam = sam_model(**inputs_sam, multimask_output=True)
                     masks = sam_processor.post_process_masks(
                         outputs_sam.pred_masks.cpu(),
                         inputs_sam["original_sizes"],
                     )[0]
-                    # masks: [num_objects, num_masks, H, W] or [num_masks, H, W]; take first mask
                     if masks.numel() > 0:
-                        m = masks[0, 0] if masks.dim() == 4 else masks[0]
-                        m_binary = (m > 0.5).float()
-                        bbox = mask_to_bbox(m_binary)
-                        if bbox is not None:
-                            x0, y0, x1, y1 = bbox
+                        m, fill_ratio = pick_contour_mask(masks)
+                        if m is None:
+                            m = masks[0, 0] if masks.dim() == 4 else masks[0]
+                        if fill_ratio > args.max_fill_ratio:
+                            continue
+                        m = m.numpy().astype(np.float32)
+                        m = np.clip(m, 0.0, 1.0)
+                        crop = contour_crop_from_mask(image, m, args.padding)
+                        if crop is not None:
+                            label_slug = "jaguar"
+                            if labels is not None and i < len(labels):
+                                try:
+                                    lab = labels[i]
+                                    label_slug = prompt_to_slug(lab) if isinstance(lab, str) else f"class{lab}"
+                                except Exception:
+                                    pass
+                            out_name = f"{stem}_crop_{saved}_{label_slug}.png"
+                            crop.save(output_dir / out_name)
+                            total_crops += 1
+                            saved += 1
+                            print(f"  {path.name} -> {out_name} (score={score:.2f})")
+                            continue
                 except Exception as e:
-                    pass  # keep Grounding DINO box on SAM failure
+                    pass  # fallback to box crop below if SAM fails
 
             x0, y0, x1, y1 = expand_box(float(x0), float(y0), float(x1), float(y1), args.padding, w, h)
-            crop = image.crop((x0, y0, x1, y1))
+            crop = image.crop((x0, y0, x1, y1)).convert("RGBA")
             label_slug = "jaguar"
             if labels is not None and i < len(labels):
                 try:
@@ -215,9 +300,8 @@ def main():
                     label_slug = prompt_to_slug(lab) if isinstance(lab, str) else f"class{lab}"
                 except Exception:
                     pass
-            ext = path.suffix.lower()
-            out_name = f"{stem}_crop_{saved}_{label_slug}{ext}"
-            crop.save(output_dir / out_name, quality=95)
+            out_name = f"{stem}_crop_{saved}_{label_slug}.png"
+            crop.save(output_dir / out_name)
             total_crops += 1
             saved += 1
             print(f"  {path.name} -> {out_name} (score={score:.2f})")

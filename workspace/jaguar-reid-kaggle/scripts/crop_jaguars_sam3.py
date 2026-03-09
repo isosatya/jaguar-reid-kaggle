@@ -2,20 +2,8 @@
 """
 Crop raw jaguar images to jaguar-only regions using SAM 3.
 
-Images often show parts of jaguars with vegetation; prompts are chosen to describe
-visible parts (fur, body, rosette, etc.) so the model does not expect a full animal.
-
-Designed to run on a GPU pod (e.g. RunPod). Use --allow-cpu for local testing (slow).
-
-Two modes:
-- Text prompt: part-friendly default prompts (jaguar fur, body, rosette, etc.).
-- Reference crops: data/train_crops/train (up to 5 random examples, box-prompt mode).
-
-Usage:
-    python scripts/crop_jaguars_sam3.py
-    python scripts/crop_jaguars_sam3.py --limit 5
-    python scripts/crop_jaguars_sam3.py --resume
-    python scripts/crop_jaguars_sam3.py --allow-cpu
+Outputs contour crops (jaguar shape, transparent background) as PNG, not rectangular frames.
+Images often show parts of jaguars with vegetation; prompts describe visible parts (fur, body, rosette, etc.).
 """
 
 from __future__ import annotations
@@ -26,6 +14,7 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -203,6 +192,49 @@ def expand_box(x0: float, y0: float, x1: float, y1: float, padding: float, w: in
     return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
 
 
+def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08) -> Image.Image | None:
+    """Crop image to the mask contour (transparent outside). Returns RGBA PIL Image or None if mask empty.
+    Uses continuous mask values for alpha so edges are soft, not hard rectangles."""
+    if hasattr(mask, "cpu"):
+        mask = mask.cpu().numpy()
+    mask = np.asarray(mask).squeeze().astype(np.float32)
+    if mask.ndim != 2 or mask.size == 0:
+        return None
+    # Clip to [0,1] in case of logits or out-of-range
+    mask = np.clip(mask, 0.0, 1.0)
+    h, w = mask.shape
+    if image.size != (w, h):
+        mask = np.array(Image.fromarray((mask * 255).astype(np.uint8)).resize(image.size, Image.LANCZOS)) / 255.0
+        h, w = mask.shape
+    # Tight bbox from foreground (low threshold to include soft edges)
+    binary = mask > 0.2
+    ys = np.any(binary, axis=1)
+    xs = np.any(binary, axis=0)
+    y_where = np.where(ys)[0]
+    x_where = np.where(xs)[0]
+    if len(y_where) == 0 or len(x_where) == 0:
+        return None
+    y0, y1 = int(y_where[0]), int(y_where[-1]) + 1
+    x0, x1 = int(x_where[0]), int(x_where[-1]) + 1
+    bw, bh = x1 - x0, y1 - y0
+    dx = max(1, int(bw * padding))
+    dy = max(1, int(bh * padding))
+    x0 = max(0, x0 - dx)
+    y0 = max(0, y0 - dy)
+    x1 = min(w, x1 + dx)
+    y1 = min(h, y1 + dy)
+    img_crop = np.array(image.crop((x0, y0, x1, y1)))
+    if img_crop.ndim == 2:
+        img_crop = np.stack([img_crop] * 3, axis=-1)
+    mask_crop = mask[y0:y1, x0:x1].astype(np.float32)
+    if mask_crop.shape[:2] != img_crop.shape[:2]:
+        mask_crop = np.array(Image.fromarray((mask_crop * 255).astype(np.uint8)).resize((img_crop.shape[1], img_crop.shape[0]), Image.LANCZOS)) / 255.0
+    # Continuous alpha: soft edges instead of hard rectangle
+    alpha = (np.clip(mask_crop, 0, 1) * 255).astype(np.uint8)
+    rgba = np.dstack([img_crop[..., 0], img_crop[..., 1], img_crop[..., 2], alpha])
+    return Image.fromarray(rgba, "RGBA")
+
+
 def main():
     args = parse_args()
     device = get_device(args)
@@ -294,9 +326,9 @@ def main():
             except ValueError:
                 stem = path.stem
             if args.resume:
-                existing = list(output_dir.glob(f"{stem}_crop_*_{prompt_slug}{path.suffix}"))
+                existing = list(output_dir.glob(f"{stem}_crop_*_{prompt_slug}.png"))
                 if not existing and len(prompt_list) == 1:
-                    existing = list(output_dir.glob(f"{stem}_crop_*{path.suffix}"))
+                    existing = list(output_dir.glob(f"{stem}_crop_*.png"))
                 if existing:
                     skipped += 1
                     continue
@@ -314,6 +346,7 @@ def main():
                 state = processor.set_text_prompt(prompt, state)
             boxes = state["boxes"]
             scores = state["scores"]
+            masks = state.get("masks")  # [N, 1, H, W] or [N, H, W]
             if boxes is None or len(boxes) == 0:
                 continue
             boxes = boxes.cpu()
@@ -325,19 +358,22 @@ def main():
                 area = (x1 - x0) * (y1 - y0)
                 if area < args.min_area:
                     continue
-                x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
-                crop_w = x1 - x0
-                crop_h = y1 - y0
-                crop_area = crop_w * crop_h
                 image_area = w * h
-                if image_area > 0 and (crop_area / image_area) > args.max_area_ratio:
-                    print(f"  {path.name} -> skip crop {i} (crop is {100*crop_area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
+                if image_area > 0 and (area / image_area) > args.max_area_ratio:
+                    print(f"  {path.name} -> skip crop {i} (crop is {100*area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
                     continue
-                crop = image.crop((x0, y0, x1, y1))
-                ext = path.suffix.lower()
+                if masks is not None and i < masks.shape[0]:
+                    m = masks[i].squeeze()
+                    crop = contour_crop_from_mask(image, m, args.padding)
+                else:
+                    x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
+                    crop = image.crop((x0, y0, x1, y1)).convert("RGBA")
+                if crop is None:
+                    continue
+                ext = ".png"
                 out_name = f"{stem}_crop_{i}_{prompt_slug}{ext}"
                 out_path = output_dir / out_name
-                crop.save(out_path, quality=95)
+                crop.save(out_path)
                 total_crops += 1
                 print(f"  {path.name} -> {out_name} (score={score:.2f})")
 
