@@ -2,26 +2,19 @@
 """
 Crop raw jaguar images to jaguar-only regions using SAM 3.
 
-Designed to run on a GPU pod (e.g. RunPod). By default refuses to run without
-CUDA so you don't accidentally run heavy inference on a local machine. Use
---allow-cpu only for local testing (will be slow).
+Images often show parts of jaguars with vegetation; prompts are chosen to describe
+visible parts (fur, body, rosette, etc.) so the model does not expect a full animal.
+
+Designed to run on a GPU pod (e.g. RunPod). Use --allow-cpu for local testing (slow).
 
 Two modes:
-- Text prompt: use --prompts / --single (no reference dir).
-- Reference crops: by default the script uses data/train_crops/train (hardcoded).
-  It picks up to 5 random crop examples and runs in reference (box-prompt) mode.
-  Do not use processed_gallery crops as reference.
+- Text prompt: part-friendly default prompts (jaguar fur, body, rosette, etc.).
+- Reference crops: data/train_crops/train (up to 5 random examples, box-prompt mode).
 
-Usage (on RunPod / GPU machine):
+Usage:
     python scripts/crop_jaguars_sam3.py
-
-Dry run (few samples only):
     python scripts/crop_jaguars_sam3.py --limit 5
-
-Resume after pod stop:
     python scripts/crop_jaguars_sam3.py --resume
-
-Usage (local, allow CPU for testing):
     python scripts/crop_jaguars_sam3.py --allow-cpu
 """
 
@@ -49,13 +42,17 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # Max number of reference crop examples to use when reference-crops-dir is set
 MAX_REFERENCE_CROP_EXAMPLES = 5
 
-# Default prompts used when neither --prompts nor --single is set (dry-run comparison)
+# Default prompts: describe parts/visible regions so the model does not expect a full jaguar
+# (images often show partial jaguar with vegetation)
 DEFAULT_PROMPTS = [
-    "jaguar",
+    "part of a jaguar",
+    "jaguar fur",
     "jaguar body",
-    "jaguar flank",
     "jaguar rosette",
-    "jaguar fur pattern",
+    "jaguar flank",
+    "jaguar skin",
+    "jaguar pattern",
+    "big cat fur",
 ]
 
 
@@ -85,8 +82,8 @@ def parse_args():
     p.add_argument(
         "--prompt",
         type=str,
-        default="jaguar",
-        help='Single prompt (used only with --single).',
+        default="part of a jaguar",
+        help='Single prompt (used only with --single). Use part-friendly phrases.',
     )
     p.add_argument(
         "--prompts",
@@ -103,14 +100,14 @@ def parse_args():
     p.add_argument(
         "--min-score",
         type=float,
-        default=0.4,
-        help="Minimum detection score to keep a crop (0–1)",
+        default=0.28,
+        help="Minimum detection score to keep a crop (0–1). Lower to keep partial/occluded jaguar regions.",
     )
     p.add_argument(
         "--min-area",
         type=int,
-        default=2000,
-        help="Minimum bounding box area in pixels to keep a detection",
+        default=800,
+        help="Minimum bounding box area in pixels to keep a detection (partial jaguars can be small).",
     )
     p.add_argument(
         "--padding",
