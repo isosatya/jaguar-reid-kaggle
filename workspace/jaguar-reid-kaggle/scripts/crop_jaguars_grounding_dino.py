@@ -76,7 +76,7 @@ def pick_contour_mask(masks: torch.Tensor) -> tuple[torch.Tensor | None, float]:
     return masks[best_idx], best_ratio
 
 
-def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08, crisp_contour: bool = False) -> Image.Image | None:
+def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08, crisp_contour: bool = False, crisp_threshold: float = 0.5, exclude_green: bool = False) -> Image.Image | None:
     """Crop image to the mask contour (transparent outside). crisp_contour=False: soft edges; True: hard contour."""
     if hasattr(mask, "cpu"):
         mask = mask.cpu().numpy()
@@ -88,6 +88,13 @@ def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08, cris
     if image.size != (w, h):
         mask = np.array(Image.fromarray((mask * 255).astype(np.uint8)).resize(image.size, Image.LANCZOS)) / 255.0
         h, w = mask.shape
+    if exclude_green:
+        img_arr = np.array(image)
+        if img_arr.ndim >= 3 and img_arr.shape[-1] >= 3:
+            r, g, b = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2]
+            green_strong = (g > r) & (g > b) & (g > 80)
+            uncertain = (mask > 0.2) & (mask < 0.8)
+            mask = np.where(green_strong & uncertain, 0.0, mask).astype(np.float32)
     binary = mask > 0.2
     ys = np.any(binary, axis=1)
     xs = np.any(binary, axis=0)
@@ -111,7 +118,7 @@ def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08, cris
     if mask_crop.shape[:2] != img_crop.shape[:2]:
         mask_crop = np.array(Image.fromarray((mask_crop * 255).astype(np.uint8)).resize((img_crop.shape[1], img_crop.shape[0]), Image.LANCZOS)) / 255.0
     if crisp_contour:
-        alpha = (np.where(mask_crop > 0.5, 255, 0)).astype(np.uint8)
+        alpha = (np.where(mask_crop > crisp_threshold, 255, 0)).astype(np.uint8)
     else:
         alpha = (np.clip(mask_crop, 0, 1) * 255).astype(np.uint8)
     rgba = np.dstack([img_crop[..., 0], img_crop[..., 1], img_crop[..., 2], alpha])
@@ -135,6 +142,8 @@ def parse_args():
     p.add_argument("--max-area-ratio", type=float, default=0.90)
     p.add_argument("--max-fill-ratio", type=float, default=0.92, help="Skip when best mask fill ratio > this (1.0=allow squares).")
     p.add_argument("--crisp-contour", action="store_true", help="Binary alpha for hard contour (default: soft edges).")
+    p.add_argument("--crisp-threshold", type=float, default=0.5, help="With --crisp-contour: mask > this is inside (0.6-0.7 = tighter).")
+    p.add_argument("--exclude-green", action="store_true", help="Zero mask in green vegetation zones at uncertain boundaries.")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--allow-cpu", action="store_true")
@@ -239,7 +248,18 @@ def main():
                 continue
 
             input_boxes = [[[x0, y0, x1, y1]]]
-            inputs_sam = sam_processor(images=image, input_boxes=input_boxes, return_tensors="pt").to(device)
+            cx, cy = int(round((x0 + x1) / 2)), int(round((y0 + y1) / 2))
+            input_points, input_labels = [[[[cx, cy]]]], [[[1]]]
+            try:
+                inputs_sam = sam_processor(
+                    images=image,
+                    input_boxes=input_boxes,
+                    input_points=input_points,
+                    input_labels=input_labels,
+                    return_tensors="pt",
+                ).to(device)
+            except Exception:
+                inputs_sam = sam_processor(images=image, input_boxes=input_boxes, return_tensors="pt").to(device)
             with torch.no_grad():
                 outputs_sam = sam_model(**inputs_sam, multimask_output=True)
             masks = sam_processor.post_process_masks(
@@ -255,7 +275,7 @@ def main():
                 continue
             m = m.numpy().astype(np.float32)
             m = np.clip(m, 0.0, 1.0)
-            crop = contour_crop_from_mask(image, m, args.padding, crisp_contour=args.crisp_contour)
+            crop = contour_crop_from_mask(image, m, args.padding, crisp_contour=args.crisp_contour, crisp_threshold=getattr(args, "crisp_threshold", 0.5), exclude_green=getattr(args, "exclude_green", False))
             if crop is None:
                 continue
 

@@ -144,6 +144,7 @@ def parse_args():
         metavar="PATH",
         help="(Deprecated) Single reference crop path. Prefer --reference-crops-dir.",
     )
+    p.add_argument("--no-reference", action="store_true", help="Use text prompts only; skip reference mode.")
     return p.parse_args()
 
 
@@ -254,7 +255,7 @@ def main():
         reference_crop_paths = [ref_path]
         use_reference_crop = True
         print(f"Using reference-crop mode (no text prompt): {ref_path.name}")
-    elif args.reference_crops_dir is not None:
+    elif not args.no_reference and args.reference_crops_dir is not None:
         ref_dir = args.reference_crops_dir.resolve()
         if not ref_dir.is_dir():
             print(
