@@ -31,17 +31,12 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # Max number of reference crop examples to use when reference-crops-dir is set
 MAX_REFERENCE_CROP_EXAMPLES = 5
 
-# Default prompts: describe parts/visible regions so the model does not expect a full jaguar
-# (images often show partial jaguar with vegetation)
+# Prefer object-level prompts to avoid matching water/foliage; one part-friendly for occluded shots
 DEFAULT_PROMPTS = [
+    "a jaguar",
+    "jaguar",
     "part of a jaguar",
-    "jaguar fur",
     "jaguar body",
-    "jaguar rosette",
-    "jaguar flank",
-    "jaguar skin",
-    "jaguar pattern",
-    "big cat fur",
 ]
 
 
@@ -71,8 +66,8 @@ def parse_args():
     p.add_argument(
         "--prompt",
         type=str,
-        default="part of a jaguar",
-        help='Single prompt (used only with --single). Use part-friendly phrases.',
+        default="a jaguar",
+        help='Single prompt (used only with --single). Use "a jaguar" to avoid texture false matches.',
     )
     p.add_argument(
         "--prompts",
@@ -89,8 +84,8 @@ def parse_args():
     p.add_argument(
         "--min-score",
         type=float,
-        default=0.28,
-        help="Minimum detection score to keep a crop (0–1). Lower to keep partial/occluded jaguar regions.",
+        default=0.35,
+        help="Minimum detection score (0-1). Higher reduces water/background false crops.",
     )
     p.add_argument(
         "--min-area",

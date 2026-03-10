@@ -58,6 +58,7 @@ def parse_args():
     p.add_argument("--padding", type=float, default=0.08)
     p.add_argument("--max-area-ratio", type=float, default=0.90)
     p.add_argument("--max-fill-ratio", type=float, default=0.92, help="Skip when best mask fill ratio > this (1.0=allow squares).")
+    p.add_argument("--crisp-contour", action="store_true", help="Binary alpha for hard contour (default: soft edges).")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--allow-cpu", action="store_true")
@@ -120,8 +121,8 @@ def pick_contour_mask(masks: torch.Tensor) -> tuple[torch.Tensor | None, float]:
     return masks[best_idx], best_ratio
 
 
-def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08) -> Image.Image | None:
-    """Crop image to the mask contour (transparent outside). Uses continuous mask for soft edges."""
+def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08, crisp_contour: bool = False) -> Image.Image | None:
+    """Crop image to the mask contour (transparent outside). crisp_contour=False: soft edges; True: hard contour."""
     if hasattr(mask, "cpu"):
         mask = mask.cpu().numpy()
     mask = np.asarray(mask).squeeze().astype(np.float32)
@@ -154,7 +155,10 @@ def contour_crop_from_mask(image: Image.Image, mask, padding: float = 0.08) -> I
     mask_crop = mask[y0:y1, x0:x1].astype(np.float32)
     if mask_crop.shape[:2] != img_crop.shape[:2]:
         mask_crop = np.array(Image.fromarray((mask_crop * 255).astype(np.uint8)).resize((img_crop.shape[1], img_crop.shape[0]), Image.LANCZOS)) / 255.0
-    alpha = (np.clip(mask_crop, 0, 1) * 255).astype(np.uint8)
+    if crisp_contour:
+        alpha = (np.where(mask_crop > 0.5, 255, 0)).astype(np.uint8)
+    else:
+        alpha = (np.clip(mask_crop, 0, 1) * 255).astype(np.uint8)
     rgba = np.dstack([img_crop[..., 0], img_crop[..., 1], img_crop[..., 2], alpha])
     return Image.fromarray(rgba, "RGBA")
 
@@ -273,7 +277,7 @@ def main():
                             continue
                         m = m.numpy().astype(np.float32)
                         m = np.clip(m, 0.0, 1.0)
-                        crop = contour_crop_from_mask(image, m, args.padding)
+                        crop = contour_crop_from_mask(image, m, args.padding, crisp_contour=args.crisp_contour)
                         if crop is not None:
                             label_slug = "jaguar"
                             if labels is not None and i < len(labels):
