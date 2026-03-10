@@ -31,12 +31,17 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # Max number of reference crop examples to use when reference-crops-dir is set
 MAX_REFERENCE_CROP_EXAMPLES = 5
 
-# Prefer object-level prompts to avoid matching water/foliage; one part-friendly for occluded shots
+# Include front-view and angled/tilted side views so more images get crops
 DEFAULT_PROMPTS = [
     "a jaguar",
     "jaguar",
-    "part of a jaguar",
+    "jaguar head",
+    "jaguar face",
     "jaguar body",
+    "jaguar flank",
+    "jaguar side",
+    "part of a jaguar",
+    "big cat",
 ]
 
 
@@ -84,8 +89,8 @@ def parse_args():
     p.add_argument(
         "--min-score",
         type=float,
-        default=0.35,
-        help="Minimum detection score (0-1). Higher reduces water/background false crops.",
+        default=0.28,
+        help="Minimum detection score (0-1). Lower keeps tilted/angled and front views.",
     )
     p.add_argument(
         "--min-area",
@@ -310,6 +315,7 @@ def main():
     processor = Sam3Processor(model, device=device, confidence_threshold=args.min_score)
     print("Model loaded.")
 
+    report_entries: dict[Path, dict] = {}
     total_crops = 0
     skipped = 0
     for prompt in prompt_list:
@@ -328,9 +334,12 @@ def main():
                 if existing:
                     skipped += 1
                     continue
+            report_entries.setdefault(path, {"crops_saved": 0, "reasons": set(), "open_error": None})
             try:
                 image = Image.open(path).convert("RGB")
             except Exception as e:
+                report_entries[path]["reasons"].add("open_failed")
+                report_entries[path]["open_error"] = str(e)
                 print(f"Skip {path}: {e}", file=sys.stderr)
                 continue
             w, h = image.size
@@ -344,6 +353,7 @@ def main():
             scores = state["scores"]
             masks = state.get("masks")  # [N, 1, H, W] or [N, H, W]
             if boxes is None or len(boxes) == 0:
+                report_entries[path]["reasons"].add("no_detections")
                 continue
             boxes = boxes.cpu()
             scores = scores.cpu()
@@ -353,9 +363,11 @@ def main():
                 x0, y0, x1, y1 = box
                 area = (x1 - x0) * (y1 - y0)
                 if area < args.min_area:
+                    report_entries[path]["reasons"].add("crop_too_small")
                     continue
                 image_area = w * h
                 if image_area > 0 and (area / image_area) > args.max_area_ratio:
+                    report_entries[path]["reasons"].add("crop_too_large")
                     print(f"  {path.name} -> skip crop {i} (crop is {100*area/image_area:.0f}% of image, use --max-area-ratio 1.0 to allow)")
                     continue
                 if masks is not None and i < masks.shape[0]:
@@ -365,7 +377,9 @@ def main():
                     x0, y0, x1, y1 = expand_box(x0, y0, x1, y1, args.padding, w, h)
                     crop = image.crop((x0, y0, x1, y1)).convert("RGBA")
                 if crop is None:
+                    report_entries[path]["reasons"].add("mask_empty")
                     continue
+                report_entries[path]["crops_saved"] = report_entries[path].get("crops_saved", 0) + 1
                 ext = ".png"
                 out_name = f"{stem}_crop_{i}_{prompt_slug}{ext}"
                 out_path = output_dir / out_name
@@ -376,6 +390,38 @@ def main():
     if args.resume and skipped:
         print(f"Skipped {skipped} image(s) (already had crops).")
     print(f"Done. Saved {total_crops} crops to {output_dir}")
+
+    excluded = [(p, report_entries[p]) for p in sorted(report_entries) if report_entries[p].get("crops_saved", 0) == 0]
+    report_path = output_dir / "crop_exclusion_report.txt"
+    with open(report_path, "w") as f:
+        f.write("SAM3 crop run – excluded images summary\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Output folder: {output_dir}\n")
+        f.write(f"Total crops saved: {total_crops}\n")
+        f.write(f"Images excluded (no crop saved): {len(excluded)}\n\n")
+        if not excluded:
+            f.write("No images were excluded; all processed images had at least one crop saved.\n")
+        else:
+            f.write("Excluded images and reasons:\n")
+            f.write("-" * 60 + "\n")
+            for path, data in excluded:
+                rel = path.name
+                try:
+                    rel = str(path.relative_to(input_dir))
+                except ValueError:
+                    pass
+                reasons = data.get("reasons") or set()
+                reason_str = ", ".join(sorted(reasons)) if reasons else "unknown"
+                if "open_failed" in reasons and data.get("open_error"):
+                    reason_str += f" ({data['open_error']})"
+                f.write(f"  {rel}\n    Reason: {reason_str}\n")
+        f.write("\nReason legend:\n")
+        f.write("  no_detections   – model returned no boxes above confidence threshold\n")
+        f.write("  crop_too_small  – detection area below --min-area\n")
+        f.write("  crop_too_large  – detection area above --max-area-ratio (e.g. full frame)\n")
+        f.write("  mask_empty     – segmentation mask produced empty contour crop\n")
+        f.write("  open_failed    – image file could not be opened\n")
+    print(f"Exclusion report written to {report_path}")
 
 
 if __name__ == "__main__":
